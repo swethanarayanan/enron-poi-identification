@@ -1,4 +1,1 @@
-# have-you-met-ted-talks
-Data Science and Recommendation Algos on Ted Talks Dataset
-
-Dataset from https://www.kaggle.com/rounakbanik/ted-talks
+This project was done as a final project for a NUS MSBA course comparing all famous machine learning algorithms and text analytic approaches. 
