@@ -1,0 +1,567 @@
+---
+title: "BT5152 Final Project "
+author: "Group 14"
+date: "11/13/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE, warnings=FALSE, messages=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Libraries
+```{r}
+library(ggplot2)
+library(tm)
+library(ROCR)
+library(parallel)
+library(doParallel)
+library(e1071)
+library(C50)
+library(DMwR)
+library(caret)
+library(rpart)
+library(plyr)
+library(dplyr)
+library(stringr)
+library(jsonlite)
+library(topicmodels)
+library(tidytext)
+library(tidyr)
+library(tibble)
+library(tidyverse)
+library(tm.lexicon.GeneralInquirer)
+```
+### Start cluster
+```{r}
+cl = makePSOCKcluster(detectCores() - 1)
+registerDoParallel(cl)
+tm_parLapply_engine(cl)
+```
+
+### Read Datasets
+```{r}
+emails <- readxl::read_xlsx("email_data.xlsx")
+enron <- read.csv("enron_cleaned.csv", stringsAsFactors = FALSE)
+merged <- merge(emails, enron, by.x = "X-From", by.y = "X")
+merged <- merged[,-2]
+merged$poi <- as.factor(merged$poi)
+```
+
+## Data Exploration
+```{r}
+payment_data <- c('salary',
+                'bonus',
+                'long_term_incentive',
+                'deferred_income',
+                'deferral_payments',
+                'loan_advances',
+                'other',
+                'expenses',                
+                'director_fees', 
+                'total_payments')
+
+stock_data <- c('exercised_stock_options',
+              'restricted_stock',
+              'restricted_stock_deferred',
+              'total_stock_value')
+
+email_data <- c("content",
+              "to_messages",
+              'from_messages',
+              'from_poi_to_this_person',
+              'from_this_person_to_poi',
+              'shared_receipt_with_poi')
+
+features_list <- paste(c('poi'), payment_data , stock_data ,email_data)
+
+nrow(merged)
+sum(as.numeric(merged$poi)-1)
+summary(merged)
+```
+
+## TF-IDF/Dictionary Approach Features
+```{r}
+email_corpus <- VCorpus(VectorSource(merged$content))
+email_corpus <- tm_map(email_corpus, content_transformer(tolower))
+email_corpus <- tm_map(email_corpus, content_transformer(gsub), pattern="\\W",replace=" ") # remove emojis
+email_corpus <- tm_map(email_corpus, removeNumbers) # remove numbers
+email_corpus <- tm_map(email_corpus, removeWords, stopwords("SMART")) # remove stop words
+email_corpus <- tm_map(email_corpus, removePunctuation) # remove punctuation
+email_corpus <- tm_map(email_corpus, stemDocument)
+conv2space <- content_transformer(function (x , pattern ) gsub(pattern, " ", x))
+email_corpus <- tm_map(email_corpus, conv2space, "/")
+email_corpus <- tm_map(email_corpus, conv2space, "@")
+email_corpus <- tm_map(email_corpus, conv2space, "!")
+email_corpus <- tm_map(email_corpus, stripWhitespace) # eliminate unneeded whitespace
+
+dtm_control <- list(weighting = function(x) weightTfIdf(x, normalize = FALSE))
+email_dtm <- DocumentTermMatrix(email_corpus, control = dtm_control)
+
+# neg score 
+dict_features1 <- tm_term_score(email_dtm, terms_in_General_Inquirer_categories("Negativ")) 
+
+# ethics score
+dict_features2 <- tm_term_score(email_dtm, terms_in_General_Inquirer_categories("RcEthic")) 
+
+dict_features <- cbind(dict_features1, dict_features2)
+
+```
+
+## Document-Topic Distributions as Features
+```{r}
+# need weightTf matrix, not Tf-IDF
+dtm_control2 <- list(weighting = weightTf)
+email_dtm2 <- DocumentTermMatrix(email_corpus, control = dtm_control2)
+
+dtm_control2$dictionary <- findFreqTerms(email_dtm2, lowfreq = 100)
+email_dtm2 <- DocumentTermMatrix(email_corpus, control = dtm_control2)
+
+# Remove docs which all frequencies are zeros (side effect of high frequency terms filtering during pre-processing)
+row_totals <- apply(email_dtm2 , 1, sum)
+email_dtm2 <- email_dtm2[apply(email_dtm2 , 1, sum) > 0,]
+
+heldout_index <- sample(email_dtm2$nrow*0.1)
+
+ks <- seq(2, 6, 1)
+
+topic_models <- parSapply(cl = cl, ks, function(k, data) topicmodels::LDA(data, k = k, method = "Gibbs", control = list(iter = 3000, seed = 5152)), data = email_dtm2[-heldout_index,])
+
+perplexities <- parSapply(cl = cl, topic_models, function(m, data) topicmodels::perplexity(m, data, use_theta = TRUE, estimate_theta = TRUE), data = email_dtm2[heldout_index,])
+
+optimal_idx <- which.min(perplexities)
+
+# get document-topic dist for all of email_dtm2 with posterior, then use those as features, add to features_df # # --> need to preserve names
+docs_topics <- posterior(topic_models[[optimal_idx]], email_dtm2)
+document_topic_dist <- docs_topics[["topics"]]
+
+colnames(document_topic_dist) <- paste("Topic", colnames(document_topic_dist), sep = "_")
+
+# Make sure to stop cluster *plus* insert serial backend
+stopCluster(cl); print("Cluster stopped.")
+# insert serial backend, otherwise error in repetetive tasks
+registerDoSEQ()
+```
+## Topic-Term Visualization
+```{r}
+lda <- topic_models[[optimal_idx]]
+
+lda_td <- tidy(lda)
+
+top_terms <- lda_td %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+top_terms
+
+# visualization
+top_terms %>%
+  mutate(term = reorder(term, beta)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_bar(alpha = 0.8, stat = "identity", show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip()
+```
+
+## Feature from Python Doc2Vec Clustering (code to create this feature is in Python file)
+```{r}
+doc2vec_cluster_labels <- read.csv("labels.csv", stringsAsFactors = FALSE, header = F)
+doc2vec_cluster_labels <- doc2vec_cluster_labels$V2
+```
+
+## Create Latent Semantic Analyis Model on TF-IDF Vectors and use SVD to reduce Dimension then Feed into Features for Modelling (Code to create this feature is in Python file)
+```{r}
+lsa_features <- read.csv("lsa_svd_10.csv", stringsAsFactors = FALSE, header = F)
+lsa_features <- select(lsa_features, -V11)
+colnames(lsa_features) <- lapply(colnames(lsa_features), paste0, "lsa")
+```
+
+## Scale numerical variables
+```{r}
+normalize <- function(x) { 
+  return((x - min(x)) / (max(x) - min(x)))
+}
+
+combined_features_df <- merged[,-c(1,2,3)]
+combined_features_df <- combined_features_df %>% mutate_if(is.numeric, normalize)
+```
+
+## Combine Text Features to original feature list
+```{r}
+colnames(combined_features_df) <- paste("Main", colnames(combined_features_df), sep = "_")
+
+combined_features_df <- cbind(combined_features_df, doc2vec_cluster_labels, document_topic_dist, dict_features, lsa_features)
+
+# remove features with near zero variance - Main_loan_advances and Main_director_fees and Main_restricted_stock_deferred
+combined_features_df <- select(combined_features_df, -Main_loan_advances, -Main_director_fees, -Main_restricted_stock_deferred)
+```
+
+## 3A - Split into training and validation and perform scaling
+```{r}
+set.seed(5152)
+train_idx <- createDataPartition(merged$poi, p = 0.7, list = FALSE)
+
+# to see if train and test have balanced distribution of POI
+###################################
+train_merge <- merged[train_idx,]
+test_merge <- merged[-train_idx,]
+
+table(train_merge$poi)
+table(test_merge$poi)
+###################################
+
+train_features_df <- combined_features_df[train_idx,]
+test_features_df <- combined_features_df[-train_idx,]
+
+train_poi <- as.data.frame(merged[train_idx,"poi"])
+colnames(train_poi) <- c("poi")
+test_poi <- as.data.frame(merged[-train_idx,"poi"])
+colnames(test_poi) <- c("poi")
+```
+
+## 3B - Baseline Cross-validated C5.0 Model with Up-Sampling
+```{r}
+# common control for all the baseline methods in 3B and 3C
+control <- trainControl(method = "repeatedcv", number = 5, repeats = 2, sampling = "up", classProbs = TRUE, summaryFunction = twoClassSummary)
+
+# winnow - feature selection or not, trials - number of boosting iterations
+grid <- expand.grid(.model = "tree", .winnow = c(TRUE,FALSE), .trials = 1:5) 
+
+set.seed(5152)
+model_C50 <- train(poi ~ ., data = cbind(train_features_df, train_poi), method = "C5.0", 
+                   metric = "ROC", trControl = control, 
+                   preProcess = c("scale", "center"), 
+                   tuneGrid = grid)
+
+model_C50$bestTune
+
+train_pred_C50 <- predict(model_C50, train_features_df) #predict
+mean(train_pred_C50 == train_poi$poi)
+
+test_pred_C50 <- predict(model_C50, test_features_df) #predict
+mean(test_pred_C50 == test_poi$poi) 
+
+# PRECISION and RECALL
+train_cm_C50 <- table(train_pred_C50, train_poi$poi)
+confusionMatrix(train_cm_C50, mode = 'everything', positive = "True")
+
+
+test_cm_C50 <- table(test_pred_C50, test_poi$poi)
+confusionMatrix(test_cm_C50, mode = 'everything', positive = "True")
+
+
+# AUC
+test_pred_C50 <- ROCR::prediction(as.numeric(test_pred_C50), as.numeric(test_poi$poi))
+as.numeric(performance(test_pred_C50, "auc")@y.values) # 0.69 auc
+```
+
+## 3B - Baseline Cross-validated k-NN Model with Up-Sampling
+```{r}
+set.seed(5152)
+model_knn <- train(poi ~., data = cbind(train_features_df, train_poi), 
+                   method="knn", trControl = control,
+                   tuneGrid = expand.grid(k = c(3, 7, 11)),
+                   preProcess = c("scale", "center"),
+                   metric = "ROC")
+
+model_knn$bestTune
+
+# Training accuracy 
+pred_knn_tr <- predict(model_knn, newdata = train_features_df)
+mean(pred_knn_tr == train_poi$poi)
+
+# Testing accuracy
+pred_knn <- predict(model_knn,newdata = test_features_df)
+mean(pred_knn == test_poi$poi)
+
+# PRECISION and RECALL
+confusionMatrix(pred_knn_tr, train_poi$poi, mode = "everything", positive = 'True')
+confusionMatrix(pred_knn, test_poi$poi, mode = "everything", positive = 'True')
+
+
+# AUC
+test_pred_knn <- ROCR::prediction(as.numeric(pred_knn), as.numeric(test_poi$poi))
+as.numeric(performance(test_pred_knn, "auc")@y.values) 
+
+```
+
+## 3B - Baseline Cross-Validated RPart Model with Up-Sampling
+```{r}
+
+grid <- expand.grid(.cp = c(0.005, 0.01, 0.02, 0.05, 0.1))
+
+set.seed(5152)
+rpart_model <- train(poi ~ ., data = cbind(train_features_df, train_poi), 
+                           method = "rpart", metric = "ROC", 
+                           trControl = control, preProcess = c("scale", "center"), 
+                           tuneGrid = grid)
+
+rpart_model$bestTune
+
+# PRECISION and RECALL
+train_cm_rpart <- table(predict(rpart_model, train_features_df), train_poi$poi)
+confusionMatrix(train_cm_rpart, mode = 'everything', positive = "True") 
+
+test_cm_rpart <- table(predict(rpart_model, test_features_df), test_poi$poi)
+confusionMatrix(test_cm_rpart, mode = 'everything', positive = "True") 
+
+# AUC
+test_pred_rpart <- ROCR::prediction(as.numeric(predict(rpart_model, test_features_df)), as.numeric(test_poi$poi))
+as.numeric(performance(test_pred_rpart, "auc")@y.values)  
+
+```
+
+## 3B - Baseline Cross-Validated NNet Model with Up-Sampling
+```{r}
+library(nnet)
+train_nnet = cbind(train_features_df,train_poi)
+test_nnet = cbind(test_features_df,test_poi)
+
+train_nnet[is.na(train_nnet)] = 0
+test_nnet[is.na(test_nnet)] = 0
+
+grid = expand.grid(.size = c(1,2,3), .decay = c(0, 1, 2))
+
+set.seed(5152)
+model_nn = train(poi ~., method = 'nnet', data = train_nnet, metric = "ROC",
+            trControl = control, tuneGrid = grid, preProcess = c("scale", "center"))
+
+model_nn$bestTune
+# train data pred
+nn_pred_train = predict(model_nn, train_nnet)
+confusionMatrix(nn_pred_train, train_poi$poi, mode = 'everything', positive = "True") 
+
+
+# test data pred 
+nn_pred_test = predict(model_nn, test_nnet)
+confusionMatrix(nn_pred_test, test_poi$poi, mode = 'everything', positive = "True") 
+
+
+# AUC
+test_pred_nn <- ROCR::prediction(as.numeric(predict(model_nn, test_features_df)), as.numeric(test_poi$poi))
+as.numeric(performance(test_pred_nn, "auc")@y.values) 
+
+```
+
+
+## 3B - Baseline Cross-Validated Support Vector Machine Model with Up-Sampling
+```{r}
+set.seed(5152)
+
+#tuning with cost parameter
+model_svm_c <- train(factor(poi) ~., data = cbind(train_features_df, train_poi),
+                    metric = "ROC", method = "svmLinear", 
+                    trControl = control, tuneGrid = expand.grid(.C= c(1,2,0.5)))
+
+model_svm_c$bestTune
+ 
+# training accuracy 
+pred_svm_tr <- predict(model_svm_c, train_features_df)
+mean(pred_svm_tr == train_poi$poi)  
+
+# testing accuracy
+pred_svm <- predict(model_svm_c, test_features_df)
+mean(pred_svm == test_poi$poi)
+
+#PRECISION and RECALL
+confusionMatrix(pred_svm_tr, train_poi$poi, mode = 'everything', positive = 'True')
+confusionMatrix(pred_svm, test_poi$poi, mode = 'everything', positive = 'True')
+
+
+# AUC
+test_pred_svm <- ROCR::prediction(as.numeric(pred_svm), as.numeric(test_poi$poi))
+as.numeric(performance(test_pred_svm, "auc")@y.values)
+
+```
+
+
+## 3C - Ensemble: Random Forest using Ranger
+```{r}
+
+library(ranger)
+
+grid <- expand.grid(.mtry = c(9, 11, 13, 15, 20, 22, 25), .splitrule = "gini", .min.node.size = 1)
+
+# mtry = floor(sqrt(dim(train_features_df)[2])),
+                                    
+ranger_model <- train(x = train_features_df, 
+                y = train_poi$poi, 
+                method = "ranger",
+                trControl = control,
+                metric = "ROC",
+                preProcess = c("scale", "center"),
+                tuneGrid = grid)
+
+ranger_model$bestTune
+
+train_pred <- predict(ranger_model, train_features_df)
+train_cm = as.matrix(table(Actual=train_poi$poi, Predicted=train_pred))
+confusionMatrix(train_cm, mode = "everything", positive = "True") 
+
+test_pred <- predict(ranger_model, test_features_df)
+test_cm = as.matrix(table(Actual=test_poi$poi, Predicted=test_pred))
+confusionMatrix(test_cm, mode = "everything", positive = "True") 
+
+# AUC
+test_pred_ranger <- ROCR::prediction(as.numeric(predict(ranger_model, test_features_df)), as.numeric(test_poi$poi))
+as.numeric(performance(test_pred_ranger, "auc")@y.values)
+```
+
+## 3C - Ensemble: Boosting
+```{r}
+# xgboost with caret train
+grid <- expand.grid(.nrounds=c(25, 50, 100, 200),.eta=c(0.005, 0.01, 0.05, 0.1),
+                    .gamma=c(0.1,0.5, 1, 1.5),
+                     .max_depth=c(2,3,4,5),.colsample_bytree=c(0.6, 0.8, 1),
+                     .subsample=c(0.5, 0.75, 1),.min_child_weight=c(1, 2, 3, 5))
+
+
+set.seed(5152)
+
+starttime <- Sys.time()
+model_xgb <- train(poi ~ ., data = cbind(train_features_df,train_poi), 
+                   method = "xgbTree", trControl = control, 
+                   tuneGrid = grid, metric = "ROC",
+                  preProcess = c("scale", "center"))
+endtime <-Sys.time()
+
+print(endtime-starttime) # 50 minutes
+
+model_xgb$bestTune
+
+print(varImp(model_xgb))
+plot(varImp(model_xgb))
+
+# ACCURACY, PRECISION and RECALL
+
+train_cm_xgb <- table(predict(model_xgb, train_features_df), train_poi$poi)
+confusionMatrix(train_cm_xgb, mode = 'everything', positive = "True") 
+
+
+test_cm_xgb <- table(predict(model_xgb, test_features_df), test_poi$poi)
+confusionMatrix(test_cm_xgb, mode = 'everything', positive = "True") 
+
+# AUC
+test_pred_xgb <- ROCR::prediction(as.numeric(predict(model_xgb, test_features_df)), as.numeric(test_poi$poi))
+as.numeric(performance(test_pred_xgb, "auc")@y.values)
+```
+
+## 3C - Ensemble Stacking
+```{r}
+
+library(caretEnsemble)
+library(caret)
+
+TL=list(
+   m1=caretModelSpec(method='knn'),
+   m2=caretModelSpec(method='rpart'),
+   m3=caretModelSpec(method='ranger'))
+
+set.seed(5152)
+folds = createFolds(train_poi$poi, k = 5)
+
+set.seed(5152)
+stack_control = trainControl(method='repeatedcv', number=5, repeats=3, index=folds, savePredictions='final', classProbs=TRUE, summaryFunction=twoClassSummary, sampling = "up")
+
+models = caretList(poi ~ ., data = cbind(train_features_df,train_poi), metric = 'ROC', trControl=stack_control, tuneList = TL)
+
+results = resamples(models)
+summary(results)
+
+stack.glm = caretStack(models, method="glm", metric="ROC", trControl=stack_control)
+print(stack.glm)
+  
+stack_pred = predict(stack.glm, train_features_df)
+confusionMatrix(stack_pred, train_poi$poi, mode = 'everything', positive = "True")
+
+stack_pred_test = predict(stack.glm, test_features_df)
+confusionMatrix(stack_pred_test,test_poi$poi, mode = 'everything', positive = "True")
+
+### AUC
+test_pred_stack <- ROCR::prediction(as.numeric(predict(stack.glm, test_features_df)), as.numeric(test_poi$poi))
+as.numeric(performance(test_pred_stack, "auc")@y.values)
+```
+
+### 3D - Feature Engineering
+
+```{r}
+combined_features_df2 <- combined_features_df
+
+# new features 
+combined_features_df2$to_poi_ratio = merged$from_poi_to_this_person / merged$to_messages
+combined_features_df2$from_poi_ratio = merged$from_this_person_to_poi / merged$from_messages
+combined_features_df2$shared_poi_ratio = merged$shared_receipt_with_poi / merged$to_messages
+
+# financial features
+combined_features_df2$bonus_to_salary = merged$bonus / merged$salary
+combined_features_df2$bonus_to_total = merged$bonus / merged$total_payments
+combined_features_df2$bonus_to_salary[is.na(combined_features_df2$bonus_to_salary)] = 0
+combined_features_df2$bonus_to_total[is.na(combined_features_df2$bonus_to_total)] = 0
+
+# train test split again
+train_features_df2 <- combined_features_df2[train_idx,]
+test_features_df2 <- combined_features_df2[-train_idx,]
+```
+
+Report how much those 3 new features improve the prediction performance based on top algorithms in 3B and 3C. You don’t need to re-run all algorithms in 3B and C, but you need to report the results of at least ONE best algorithm in 3B and ONE best algorithm in 3C to show the benefit of features engineering.
+
+### 3B and 3C models again with engineered features
+```{r}
+###################################
+## 3B model - Best Model - RPart ##
+###################################
+
+grid <- expand.grid(.cp = c(0.005, 0.01, 0.02, 0.05, 0.1))
+
+set.seed(5152)
+rpart_model_fe <- train(poi ~ ., data = cbind(train_features_df2, train_poi), 
+                           method = "rpart", metric = "ROC", 
+                           trControl = control, preProcess = c("scale", "center"), 
+                           tuneGrid = grid)
+
+rpart_model_fe$bestTune
+
+# PRECISION and RECALL
+train_cm_rpart_fe <- table(predict(rpart_model_fe, train_features_df2), train_poi$poi)
+confusionMatrix(train_cm_rpart_fe, mode = 'everything', positive = "True") 
+
+test_cm_rpart_fe <- table(predict(rpart_model_fe, test_features_df2), test_poi$poi)
+confusionMatrix(test_cm_rpart_fe, mode = 'everything', positive = "True") 
+
+# AUC
+test_pred_rpart <- ROCR::prediction(as.numeric(predict(rpart_model, test_features_df)), as.numeric(test_poi$poi))
+as.numeric(performance(test_pred_rpart, "auc")@y.values)  
+
+############################
+## 3C Best Model - Ranger ##
+############################
+
+grid <- expand.grid(.mtry = c(9, 11, 13, 15, 20, 22, 25), .splitrule = "gini", .min.node.size = 1)
+
+# mtry = floor(sqrt(dim(train_features_df)[2])),
+                                    
+ranger_model_fe <- train(x = train_features_df2, 
+                y = train_poi$poi, 
+                method = "ranger",
+                trControl = control,
+                metric = "ROC",
+                preProcess = c("scale", "center"),
+                tuneGrid = grid)
+
+ranger_model_fe$bestTune
+
+train_pred <- predict(ranger_model_fe, train_features_df2)
+train_cm = as.matrix(table(Actual=train_poi$poi, Predicted=train_pred))
+confusionMatrix(train_cm, mode = "everything", positive = "True") 
+
+test_pred <- predict(ranger_model_fe, test_features_df2)
+test_cm = as.matrix(table(Actual=test_poi$poi, Predicted=test_pred))
+confusionMatrix(test_cm, mode = "everything", positive = "True") 
+
+# AUC
+test_pred_ranger_fe <- ROCR::prediction(as.numeric(predict(ranger_model_fe, test_features_df2)), as.numeric(test_poi$poi))
+as.numeric(performance(test_pred_ranger_fe, "auc")@y.values)
+
+```
